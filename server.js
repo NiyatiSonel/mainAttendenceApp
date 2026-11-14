@@ -23,6 +23,15 @@ app.use(cors({
 }));
 app.use(express.json());
 
+// Restore original requested URL if rewritten by Vercel serverless
+app.use((req, res, next) => {
+  const originalUrl = req.headers['x-matched-path'] || req.headers['x-forwarded-url'];
+  if (originalUrl) {
+    req.url = originalUrl;
+  }
+  next();
+});
+
 // Health route
 app.get('/api/health', (req, res) => {
   res.json({ status: 'running', timestamp: new Date().toISOString() });
