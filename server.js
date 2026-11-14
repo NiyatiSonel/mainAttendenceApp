@@ -64,3 +64,5 @@ const teacherRoutes = require('./routes/teacher');
 
 // Mount under /api/teacher
 app.use('/api/teacher', teacherRoutes);
+
+module.exports = app;
