@@ -9,6 +9,18 @@ const {
   verifyDeviceApiKey
 } = require('../middleware/auth');
 
+// Helper to decode hex strings (e.g. \x445341...) if columns were stored as BYTEA
+function decodeHexIfNeeded(str) {
+  if (typeof str === 'string' && str.startsWith('\\x')) {
+    try {
+      return Buffer.from(str.slice(2), 'hex').toString('utf8');
+    } catch (e) {
+      return str;
+    }
+  }
+  return str;
+}
+
 //------------------------------------------------------------
 // SUPER ADMIN CONFIGURATION
 //------------------------------------------------------------
@@ -228,20 +240,29 @@ router.get('/attendance-templates', verifyDeviceApiKey, async (req, res) => {
     // Get enrolled students
     const { data: enrollments, error: enrollErr } = await db
       .from('ENROLLMENTS')
-      .select('stu_ID, STUDENTS(stu_ID, roll_no, name, biometric_temp)')
+      .select('stu_ID')
       .eq('sub_ID', session.sub_ID);
 
     if (enrollErr) throw enrollErr;
 
-    const students = (enrollments || [])
-      .map(e => e.STUDENTS)
-      .filter(s => s && s.biometric_temp && s.biometric_temp !== 'PENDING_ENROLLMENT' && s.biometric_temp !== '')
-      .map(s => ({
-        studentId: s.stu_ID,
-        rollNo: s.roll_no,
-        name: s.name,
-        template: s.biometric_temp
-      }));
+    const stuIds = (enrollments || []).map(e => e.stu_ID);
+    let students = [];
+
+    if (stuIds.length > 0) {
+      const { data: stuData } = await db
+        .from('STUDENTS')
+        .select('stu_ID, roll_no, name, biometric_temp')
+        .in('stu_ID', stuIds);
+
+      students = (stuData || [])
+        .filter(s => s && s.biometric_temp && s.biometric_temp !== 'PENDING_ENROLLMENT' && s.biometric_temp !== '')
+        .map(s => ({
+          studentId: s.stu_ID,
+          rollNo: s.roll_no,
+          name: s.name,
+          template: s.biometric_temp
+        }));
+    }
 
     res.json({
       success: true,
@@ -341,18 +362,29 @@ router.get('/subjects', async (req, res) => {
   try {
     const { data: subjects, error } = await db
       .from('SUBJECT')
-      .select('sub_ID, subject_name, teacher_ID, semester_ID, TEACHER(name), SEMESTERS(semester_name)')
+      .select('sub_ID, subject_name, teacher_ID, semester_ID')
       .order('sub_ID', { ascending: true });
 
     if (error) throw error;
 
+    const [teachersRes, semestersRes] = await Promise.all([
+      db.from('TEACHER').select('teacher_ID, name'),
+      db.from('SEMESTERS').select('semester_ID, semester_name')
+    ]);
+
+    const teacherMap = {};
+    (teachersRes.data || []).forEach(t => { teacherMap[t.teacher_ID] = t.name; });
+
+    const semMap = {};
+    (semestersRes.data || []).forEach(s => { semMap[s.semester_ID] = decodeHexIfNeeded(s.semester_name); });
+
     res.json((subjects || []).map(s => ({
       id: s.sub_ID,
-      subject_name: s.subject_name,
+      subject_name: decodeHexIfNeeded(s.subject_name),
       teacher_id: s.teacher_ID,
-      teacher_name: s.TEACHER?.name || 'Unassigned',
+      teacher_name: teacherMap[s.teacher_ID] || 'Unassigned',
       semester_id: s.semester_ID,
-      semester_name: s.SEMESTERS?.semester_name || 'Unassigned'
+      semester_name: semMap[s.semester_ID] || 'Unassigned'
     })));
   } catch (err) {
     console.error('Fetch subjects error:', err.message);
@@ -423,7 +455,7 @@ router.get('/semesters', async (req, res) => {
 
     res.json((semesters || []).map(s => ({
       id: s.semester_ID,
-      semester_name: s.semester_name,
+      semester_name: decodeHexIfNeeded(s.semester_name),
       start_date: s.start_date,
       end_date: s.end_date,
       status: s.status
@@ -549,18 +581,29 @@ router.get('/enrollments', async (req, res) => {
   try {
     const { data: enrollments, error } = await db
       .from('ENROLLMENTS')
-      .select('enroll_ID, stu_ID, sub_ID, STUDENTS(roll_no, name), SUBJECT(subject_name)')
+      .select('enroll_ID, stu_ID, sub_ID')
       .order('enroll_ID', { ascending: false });
 
     if (error) throw error;
 
+    const [studentsRes, subjectsRes] = await Promise.all([
+      db.from('STUDENTS').select('stu_ID, roll_no, name'),
+      db.from('SUBJECT').select('sub_ID, subject_name')
+    ]);
+
+    const stuMap = {};
+    (studentsRes.data || []).forEach(s => { stuMap[s.stu_ID] = s; });
+
+    const subMap = {};
+    (subjectsRes.data || []).forEach(s => { subMap[s.sub_ID] = decodeHexIfNeeded(s.subject_name); });
+
     res.json((enrollments || []).map(e => ({
       id: e.enroll_ID,
       student_id: e.stu_ID,
-      roll_no: e.STUDENTS?.roll_no,
-      student_name: e.STUDENTS?.name,
+      roll_no: stuMap[e.stu_ID]?.roll_no,
+      student_name: stuMap[e.stu_ID]?.name,
       subject_id: e.sub_ID,
-      subject_name: e.SUBJECT?.subject_name
+      subject_name: subMap[e.sub_ID]
     })));
   } catch (err) {
     res.status(500).json({ error: err.message });

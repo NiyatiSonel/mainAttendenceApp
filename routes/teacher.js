@@ -5,6 +5,18 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { verifyTeacherToken } = require('../middleware/teacherAuth');
 
+// Helper to decode hex strings (e.g. \x445341...) if columns were stored as BYTEA
+function decodeHexIfNeeded(str) {
+  if (typeof str === 'string' && str.startsWith('\\x')) {
+    try {
+      return Buffer.from(str.slice(2), 'hex').toString('utf8');
+    } catch (e) {
+      return str;
+    }
+  }
+  return str;
+}
+
 // -------------------------------------------------------------
 // 1. TEACHER LOGIN
 // -------------------------------------------------------------
@@ -108,7 +120,7 @@ router.get('/profile', async (req, res) => {
       },
       subjects: (subjectsRes.data || []).map(s => ({
         id: s.sub_ID,
-        subject_name: s.subject_name
+        subject_name: decodeHexIfNeeded(s.subject_name)
       }))
     });
   } catch (err) {
@@ -198,11 +210,120 @@ router.get('/subjects/:subId/students', async (req, res) => {
       .sort((a, b) => String(a.roll_no).localeCompare(String(b.roll_no)));
 
     res.json({
-      subject,
+      subject: {
+        ...subject,
+        subject_name: decodeHexIfNeeded(subject.subject_name)
+      },
       students
     });
   } catch (err) {
     console.error('Teacher enrolled students error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// -------------------------------------------------------------
+// INDIVIDUAL STUDENT ATTENDANCE REPORT
+// -------------------------------------------------------------
+router.get('/subjects/:subId/students/:studentId/report', async (req, res) => {
+  const teacherId = req.teacher.id;
+  const subId = parseInt(req.params.subId, 10);
+  const studentId = parseInt(req.params.studentId, 10);
+
+  try {
+    // 1. Verify subject belongs to this teacher
+    const { data: subject, error: subErr } = await db
+      .from('SUBJECT')
+      .select('sub_ID, subject_name')
+      .eq('sub_ID', subId)
+      .eq('teacher_ID', teacherId)
+      .maybeSingle();
+
+    if (subErr) throw subErr;
+    if (!subject) {
+      return res.status(403).json({ error: 'Subject not found or unauthorized' });
+    }
+
+    // 2. Find student
+    const { data: student, error: stuErr } = await db
+      .from('STUDENTS')
+      .select('stu_ID, roll_no, name')
+      .eq('stu_ID', studentId)
+      .maybeSingle();
+
+    if (stuErr) throw stuErr;
+    if (!student) {
+      return res.status(404).json({ error: 'Student not found' });
+    }
+
+    // 3. Get all sessions for this subject
+    const { data: sessions, error: sessErr } = await db
+      .from('SESSIONS')
+      .select('session_ID, start_time, end_time')
+      .eq('teacher_ID', teacherId)
+      .eq('sub_ID', subId)
+      .order('start_time', { ascending: true });
+
+    if (sessErr) throw sessErr;
+    const sessionList = sessions || [];
+
+    // 4. Get attendance records for this student
+    const sessionIds = sessionList.map(s => s.session_ID);
+    let attendanceRecords = [];
+    if (sessionIds.length > 0) {
+      const { data: attData, error: attErr } = await db
+        .from('ATTENDANCE')
+        .select('session_ID, status, time_stamp')
+        .eq('stu_ID', studentId)
+        .in('session_ID', sessionIds);
+
+      if (attErr) throw attErr;
+      if (attData) attendanceRecords = attData;
+    }
+
+    const attendanceMap = {};
+    attendanceRecords.forEach(a => {
+      attendanceMap[a.session_ID] = a;
+    });
+
+    let attendedSessions = 0;
+    const history = sessionList.map(s => {
+      const record = attendanceMap[s.session_ID];
+      const isPresent = record && String(record.status).toLowerCase() === 'present';
+      if (isPresent) attendedSessions++;
+
+      return {
+        session_id: s.session_ID,
+        date: s.start_time,
+        status: isPresent ? 'Present' : 'Absent',
+        marked_time: record?.time_stamp || 'N/A'
+      };
+    });
+
+    const totalSessions = sessionList.length;
+    const absentSessions = Math.max(0, totalSessions - attendedSessions);
+    const percentage = totalSessions > 0 ? Number(((attendedSessions / totalSessions) * 100).toFixed(1)) : 0;
+
+    res.json({
+      student: {
+        id: student.stu_ID,
+        roll_no: student.roll_no,
+        name: student.name
+      },
+      subject: {
+        sub_ID: subject.sub_ID,
+        subject_name: decodeHexIfNeeded(subject.subject_name)
+      },
+      metrics: {
+        totalSessions,
+        attendedSessions,
+        absentSessions,
+        percentage
+      },
+      history
+    });
+  } catch (err) {
+    console.error('Student report error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -218,7 +339,7 @@ router.get('/subjects/:subId/report', async (req, res) => {
     // 1. Verify subject belongs to teacher
     const { data: subject, error: subErr } = await db
       .from('SUBJECT')
-      .select('sub_ID, subject_name, TEACHER(name), SEMESTERS(semester_name)')
+      .select('sub_ID, subject_name, teacher_ID, semester_ID')
       .eq('sub_ID', subId)
       .eq('teacher_ID', teacherId)
       .maybeSingle();
@@ -227,6 +348,15 @@ router.get('/subjects/:subId/report', async (req, res) => {
     if (!subject) {
       return res.status(403).json({ error: 'Subject not found or unauthorized' });
     }
+
+    // Fetch teacher & semester details separately (no PostgREST FK dependency)
+    const [teacherRes, semRes] = await Promise.all([
+      db.from('TEACHER').select('name').eq('teacher_ID', teacherId).maybeSingle(),
+      subject.semester_ID ? db.from('SEMESTERS').select('semester_name').eq('semester_ID', subject.semester_ID).maybeSingle() : Promise.resolve({ data: null })
+    ]);
+
+    const teacherName = teacherRes.data?.name || 'Unassigned';
+    const semesterName = decodeHexIfNeeded(semRes.data?.semester_name) || 'Unassigned';
 
     // 2. Get all sessions for this subject
     const { data: sessions, error: sessErr } = await db
@@ -308,9 +438,9 @@ router.get('/subjects/:subId/report', async (req, res) => {
     res.json({
       subject: {
         sub_ID: subject.sub_ID,
-        subject_name: subject.subject_name,
-        teacher_name: subject.TEACHER?.name,
-        semester_name: subject.SEMESTERS?.semester_name
+        subject_name: decodeHexIfNeeded(subject.subject_name),
+        teacher_name: teacherName,
+        semester_name: semesterName
       },
       totalSessions: sessionList.length,
       sessions: sessionList,
