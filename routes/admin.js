@@ -8,146 +8,97 @@ const {
   verifyAdminToken,
   verifyDeviceApiKey
 } = require('../middleware/auth');
+
 //------------------------------------------------------------
 // SUPER ADMIN CONFIGURATION
 //------------------------------------------------------------
 const SUPER_ADMIN = {
-  id: Number(process.env.SUPER_ADMIN_ID),
-  name: process.env.SUPER_ADMIN_NAME,
-  email: process.env.SUPER_ADMIN_EMAIL,
-  password: process.env.SUPER_ADMIN_PASSWORD,
+  id: Number(process.env.SUPER_ADMIN_ID) || 1,
+  name: process.env.SUPER_ADMIN_NAME || 'Super Admin',
+  email: process.env.SUPER_ADMIN_EMAIL || 'superadmin@attendance.com',
+  password: process.env.SUPER_ADMIN_PASSWORD || 'admin123',
   is_super: true
 };
+
+let pendingEnrollmentCommand = null;
 
 // -------------------------------------------------------------
 // 10. GET PENDING ENROLLMENT COMMAND FOR ESP32
 // -------------------------------------------------------------
-router.get('/pending-enrollment', verifyDeviceApiKey, (req, res)  => {
+router.get('/pending-enrollment', verifyDeviceApiKey, (req, res) => {
   try {
-    // No enrollment request waiting
     if (!pendingEnrollmentCommand) {
-      return res.json({
-        enroll: false
-      });
+      return res.json({ enroll: false });
     }
 
-    // Send the pending request to ESP32
     const command = pendingEnrollmentCommand;
-
-    // Clear it so the same enrollment is not processed again
     pendingEnrollmentCommand = null;
 
-    console.log(
-      `Sending enrollment request to ESP32 for student ID #${command.studentId}`
-    );
+    console.log(`Sending enrollment request to ESP32 for student ID #${command.studentId}`);
 
     res.json({
       enroll: true,
       studentId: command.studentId,
       rollNo: command.rollNo
     });
-
   } catch (err) {
     console.error('Pending enrollment error:', err.message);
-    res.status(500).json({
-      error: err.message
-    });
+    res.status(500).json({ error: err.message });
   }
 });
 
 // -------------------------------------------------------------
 // ESP32 - RECEIVE FINGERPRINT TEMPLATE
 // -------------------------------------------------------------
-// This endpoint receives the extracted fingerprint template
-// from the ESP32 and saves it against the student's ID.
-//
-// Authentication:
-// ESP32 uses x-api-key (DEVICE_API_KEY)
-// -------------------------------------------------------------
-router.post(
-  '/biometrics/upload',
-  verifyDeviceApiKey,
-  (req, res) => {
+router.post('/biometrics/upload', verifyDeviceApiKey, async (req, res) => {
+  const { studentId, biometric_template } = req.body;
 
-    const { studentId, biometric_template } = req.body;
-
-    // Validate student ID
-    if (!studentId) {
-      return res.status(400).json({
-        error: 'Student ID is required'
-      });
-    }
-
-    // Validate template
-    if (!biometric_template) {
-      return res.status(400).json({
-        error: 'Fingerprint template is required'
-      });
-    }
-
-    try {
-
-      // Check that student exists
-      const student = db
-        .prepare(
-          'SELECT stu_ID, roll_no, name FROM STUDENTS WHERE stu_ID = ?'
-        )
-        .get(studentId);
-
-      if (!student) {
-        return res.status(404).json({
-          error: 'Student not found'
-        });
-      }
-
-      // Save fingerprint template
-      const result = db
-        .prepare(
-          'UPDATE STUDENTS SET biometric_temp = ? WHERE stu_ID = ?'
-        )
-        .run(
-          biometric_template,
-          studentId
-        );
-
-      if (result.changes === 0) {
-        return res.status(500).json({
-          error: 'Fingerprint template was not saved'
-        });
-      }
-
-      console.log(
-        `Fingerprint template saved for student ID #${studentId}`
-      );
-
-      console.log(
-        `Template size received: ${biometric_template.length} characters`
-      );
-
-      return res.json({
-        success: true,
-        message: 'Fingerprint template saved successfully',
-        studentId: studentId
-      });
-
-    } catch (err) {
-
-      console.error(
-        'Fingerprint template upload error:',
-        err.message
-      );
-
-      return res.status(500).json({
-        error: err.message
-      });
-    }
+  if (!studentId) {
+    return res.status(400).json({ error: 'Student ID is required' });
   }
-);
+
+  if (!biometric_template) {
+    return res.status(400).json({ error: 'Fingerprint template is required' });
+  }
+
+  try {
+    const { data: student, error: studentErr } = await db
+      .from('STUDENTS')
+      .select('stu_ID, roll_no, name')
+      .eq('stu_ID', studentId)
+      .maybeSingle();
+
+    if (studentErr) throw studentErr;
+
+    if (!student) {
+      return res.status(404).json({ error: 'Student not found' });
+    }
+
+    const { data: updated, error: updateErr } = await db
+      .from('STUDENTS')
+      .update({ biometric_temp: biometric_template })
+      .eq('stu_ID', studentId)
+      .select();
+
+    if (updateErr) throw updateErr;
+
+    console.log(`Fingerprint template saved for student ID #${studentId}`);
+
+    return res.json({
+      success: true,
+      message: 'Fingerprint template saved successfully',
+      studentId: studentId
+    });
+  } catch (err) {
+    console.error('Fingerprint template upload error:', err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
 
 // -------------------------------------------------------------
 // 1. ADMIN LOGIN
 // -------------------------------------------------------------
-router.post('/login', (req, res) => {
+router.post('/login', async (req, res) => {
   const { email, password } = req.body;
 
   if (!email || !password) {
@@ -158,11 +109,7 @@ router.post('/login', (req, res) => {
   if (email.toLowerCase() === SUPER_ADMIN.email.toLowerCase()) {
     if (password === SUPER_ADMIN.password) {
       const token = jwt.sign(
-        {
-          id: SUPER_ADMIN.id,
-          role: 'admin',
-          isSuper: true
-        },
+        { id: SUPER_ADMIN.id, role: 'admin', isSuper: true },
         process.env.JWT_SECRET,
         { expiresIn: '8h' }
       );
@@ -178,38 +125,31 @@ router.post('/login', (req, res) => {
         }
       });
     } else {
-      return res.status(401).json({
-        error: 'Invalid admin credentials'
-      });
+      return res.status(401).json({ error: 'Invalid admin credentials' });
     }
   }
 
   // 2. Check database for normal admins
   try {
-    const admin = db.prepare(
-      'SELECT admin_ID, name, email, pass_hash FROM ADMIN WHERE LOWER(email) = LOWER(?)'
-    ).get(email);
+    const { data: admin, error } = await db
+      .from('ADMIN')
+      .select('admin_ID, name, email, pass_hash')
+      .ilike('email', email.trim())
+      .maybeSingle();
+
+    if (error) throw error;
 
     if (!admin) {
-      return res.status(401).json({
-        error: 'Invalid admin credentials'
-      });
+      return res.status(401).json({ error: 'Invalid admin credentials' });
     }
 
     const isMatch = bcrypt.compareSync(password, admin.pass_hash);
-
     if (!isMatch) {
-      return res.status(401).json({
-        error: 'Invalid admin credentials'
-      });
+      return res.status(401).json({ error: 'Invalid admin credentials' });
     }
 
     const token = jwt.sign(
-      {
-        id: admin.admin_ID,
-        role: 'admin',
-        isSuper: false
-      },
+      { id: admin.admin_ID, role: 'admin', isSuper: false },
       process.env.JWT_SECRET,
       { expiresIn: '8h' }
     );
@@ -224,41 +164,29 @@ router.post('/login', (req, res) => {
         isSuper: false
       }
     });
-
   } catch (err) {
     console.error('Admin login error:', err.message);
-
-    return res.status(500).json({
-      error: err.message
-    });
+    return res.status(500).json({ error: err.message });
   }
 });
 
 // -------------------------------------------------------------
 // ESP32 - PENDING ATTENDANCE SESSION
 // -------------------------------------------------------------
-
-let pendingAttendanceCommand = null;
-
-router.get('/pending-attendance', verifyDeviceApiKey, (req, res) => {
+router.get('/pending-attendance', verifyDeviceApiKey, async (req, res) => {
   try {
-    const session = db.prepare(`
-      SELECT
-        session_ID,
-        sub_ID,
-        device_ID
-      FROM SESSIONS
-      WHERE status = 1
-        AND datetime('now', 'localtime') >= datetime(start_time)
-        AND datetime('now', 'localtime') <= datetime(end_time)
-      ORDER BY session_ID DESC
-      LIMIT 1
-    `).get();
+    const { data: session, error } = await db
+      .from('SESSIONS')
+      .select('session_ID, sub_ID, device_ID')
+      .eq('status', 1)
+      .order('session_ID', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) throw error;
 
     if (!session) {
-      return res.json({
-        attendance: false
-      });
+      return res.json({ attendance: false });
     }
 
     res.json({
@@ -267,7 +195,6 @@ router.get('/pending-attendance', verifyDeviceApiKey, (req, res) => {
       subjectId: session.sub_ID,
       deviceId: session.device_ID
     });
-
   } catch (err) {
     console.error('Pending attendance error:', err.message);
     res.status(500).json({ error: err.message });
@@ -277,59 +204,44 @@ router.get('/pending-attendance', verifyDeviceApiKey, (req, res) => {
 // -------------------------------------------------------------
 // ESP32 - GET FINGERPRINT TEMPLATES FOR ACTIVE ATTENDANCE SESSION
 // -------------------------------------------------------------
-
-router.get('/attendance-templates', verifyDeviceApiKey, (req, res) => {
+router.get('/attendance-templates', verifyDeviceApiKey, async (req, res) => {
   try {
     const sessionId = parseInt(req.query.sessionId, 10);
 
     if (!sessionId) {
-      return res.status(400).json({
-        error: 'Session ID is required'
-      });
+      return res.status(400).json({ error: 'Session ID is required' });
     }
 
-    // ---------------------------------------------------------
-    // Check that the session is currently active by time
-    // ---------------------------------------------------------
+    const { data: session, error: sessionErr } = await db
+      .from('SESSIONS')
+      .select('session_ID, sub_ID, device_ID')
+      .eq('session_ID', sessionId)
+      .eq('status', 1)
+      .maybeSingle();
 
-    const session = db.prepare(`
-      SELECT
-        session_ID,
-        sub_ID,
-        device_ID
-      FROM SESSIONS
-      WHERE session_ID = ?
-        AND status = 1
-        AND datetime('now', 'localtime') >= datetime(start_time)
-        AND datetime('now', 'localtime') <= datetime(end_time)
-    `).get(sessionId);
+    if (sessionErr) throw sessionErr;
 
     if (!session) {
-      return res.status(404).json({
-        error: 'Active attendance session not found'
-      });
+      return res.status(404).json({ error: 'Active attendance session not found' });
     }
 
-    // ---------------------------------------------------------
-    // Get students enrolled in this subject
-    // who have a fingerprint template
-    // ---------------------------------------------------------
+    // Get enrolled students
+    const { data: enrollments, error: enrollErr } = await db
+      .from('ENROLLMENTS')
+      .select('stu_ID, STUDENTS(stu_ID, roll_no, name, biometric_temp)')
+      .eq('sub_ID', session.sub_ID);
 
-    const students = db.prepare(`
-      SELECT
-        s.stu_ID AS studentId,
-        s.roll_no AS rollNo,
-        s.name,
-        s.biometric_temp AS template
-      FROM ENROLLMENTS e
-      JOIN STUDENTS s
-        ON e.stu_ID = s.stu_ID
-      WHERE e.sub_ID = ?
-        AND s.biometric_temp IS NOT NULL
-        AND s.biometric_temp != ''
-        AND s.biometric_temp != 'PENDING_ENROLLMENT'
-      ORDER BY s.roll_no ASC
-    `).all(session.sub_ID);
+    if (enrollErr) throw enrollErr;
+
+    const students = (enrollments || [])
+      .map(e => e.STUDENTS)
+      .filter(s => s && s.biometric_temp && s.biometric_temp !== 'PENDING_ENROLLMENT' && s.biometric_temp !== '')
+      .map(s => ({
+        studentId: s.stu_ID,
+        rollNo: s.roll_no,
+        name: s.name,
+        template: s.biometric_temp
+      }));
 
     res.json({
       success: true,
@@ -338,12 +250,9 @@ router.get('/attendance-templates', verifyDeviceApiKey, (req, res) => {
       deviceId: session.device_ID,
       students
     });
-
   } catch (err) {
     console.error('Attendance templates error:', err.message);
-    res.status(500).json({
-      error: err.message
-    });
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -353,13 +262,21 @@ router.use(verifyAdminToken);
 // -------------------------------------------------------------
 // 2. DASHBOARD METRICS
 // -------------------------------------------------------------
-router.get('/stats', (req, res) => {
+router.get('/stats', async (req, res) => {
   try {
-    const totalStudents = db.prepare('SELECT COUNT(*) as count FROM STUDENTS').get()?.count || 0;
-    const totalTeachers = db.prepare('SELECT COUNT(*) as count FROM TEACHER').get()?.count || 0;
-    const totalSubjects = db.prepare('SELECT COUNT(*) as count FROM SUBJECT').get()?.count || 0;
-    const totalDevices = db.prepare('SELECT COUNT(*) as count FROM DEVICES').get()?.count || 0;
-    res.json({ totalStudents, totalTeachers, totalSubjects, totalDevices });
+    const [students, teachers, subjects, devices] = await Promise.all([
+      db.from('STUDENTS').select('*', { count: 'exact', head: true }),
+      db.from('TEACHER').select('*', { count: 'exact', head: true }),
+      db.from('SUBJECT').select('*', { count: 'exact', head: true }),
+      db.from('DEVICES').select('*', { count: 'exact', head: true })
+    ]);
+
+    res.json({
+      totalStudents: students.count || 0,
+      totalTeachers: teachers.count || 0,
+      totalSubjects: subjects.count || 0,
+      totalDevices: devices.count || 0
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -368,16 +285,22 @@ router.get('/stats', (req, res) => {
 // -------------------------------------------------------------
 // 3. TEACHER CRUD
 // -------------------------------------------------------------
-router.get('/teachers', (req, res) => {
+router.get('/teachers', async (req, res) => {
   try {
-    const teachers = db.prepare('SELECT teacher_ID as id, name, email FROM TEACHER').all();
-    res.json(teachers);
+    const { data: teachers, error } = await db
+      .from('TEACHER')
+      .select('teacher_ID, name, email')
+      .order('teacher_ID', { ascending: true });
+
+    if (error) throw error;
+
+    res.json((teachers || []).map(t => ({ id: t.teacher_ID, name: t.name, email: t.email })));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-router.post('/teachers', (req, res) => {
+router.post('/teachers', async (req, res) => {
   const { name, email, password } = req.body;
   if (!name || !email || !password) {
     return res.status(400).json({ error: 'Name, email, and password required' });
@@ -385,24 +308,26 @@ router.post('/teachers', (req, res) => {
 
   try {
     const hash = bcrypt.hashSync(password, 10);
-    const result = db.prepare(`
-      INSERT INTO TEACHER (name, email, pass_hash) 
-      VALUES (?, ?, ?)
-    `).run(name, email, hash);
+    const { data, error } = await db
+      .from('TEACHER')
+      .insert({ name: name.trim(), email: email.trim(), pass_hash: hash })
+      .select()
+      .single();
 
-    res.status(201).json({ message: 'Teacher added successfully', id: result.lastInsertRowid });
+    if (error) throw error;
+
+    res.status(201).json({ message: 'Teacher added successfully', id: data.teacher_ID });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
 });
 
-router.delete('/teachers/:id', (req, res) => {
+router.delete('/teachers/:id', async (req, res) => {
   const teacherId = parseInt(req.params.id, 10);
   try {
-    // Unlink teacher from assigned subjects first
-    db.prepare('UPDATE SUBJECT SET teacher_ID = NULL WHERE teacher_ID = ?').run(teacherId);
-    // Delete the teacher
-    db.prepare('DELETE FROM TEACHER WHERE teacher_ID = ?').run(teacherId);
+    await db.from('SUBJECT').update({ teacher_ID: null }).eq('teacher_ID', teacherId);
+    const { error } = await db.from('TEACHER').delete().eq('teacher_ID', teacherId);
+    if (error) throw error;
     res.json({ message: 'Teacher deleted successfully' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -412,97 +337,71 @@ router.delete('/teachers/:id', (req, res) => {
 // -------------------------------------------------------------
 // 4. SUBJECT CRUD & TEACHER ASSIGNMENT
 // -------------------------------------------------------------
-router.get('/subjects', (req, res) => {
+router.get('/subjects', async (req, res) => {
   try {
-    const subjects = db.prepare(`
-      SELECT 
-        s.sub_ID as id,
-        s.subject_name,
-        s.teacher_ID as teacher_id,
-        t.name as teacher_name,
-        s.semester_ID as semester_id,
-        sem.semester_name
-      FROM SUBJECT s
-      LEFT JOIN TEACHER t
-        ON s.teacher_ID = t.teacher_ID
-      LEFT JOIN SEMESTERS sem
-        ON s.semester_ID = sem.semester_ID
-      ORDER BY s.sub_ID ASC
-    `).all();
+    const { data: subjects, error } = await db
+      .from('SUBJECT')
+      .select('sub_ID, subject_name, teacher_ID, semester_ID, TEACHER(name), SEMESTERS(semester_name)')
+      .order('sub_ID', { ascending: true });
 
-    res.json(subjects.map(s => ({
-      ...s,
-      teacher_name: s.teacher_name || 'Unassigned',
-      semester_name: s.semester_name || 'Unassigned'
+    if (error) throw error;
+
+    res.json((subjects || []).map(s => ({
+      id: s.sub_ID,
+      subject_name: s.subject_name,
+      teacher_id: s.teacher_ID,
+      teacher_name: s.TEACHER?.name || 'Unassigned',
+      semester_id: s.semester_ID,
+      semester_name: s.SEMESTERS?.semester_name || 'Unassigned'
     })));
-
   } catch (err) {
     console.error('Fetch subjects error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-router.post('/subjects', (req, res) => {
-  const {
-    subject_name,
-    teacher_id,
-    semester_id
-  } = req.body;
+router.post('/subjects', async (req, res) => {
+  const { subject_name, teacher_id, semester_id } = req.body;
 
   if (!subject_name) {
-    return res.status(400).json({
-      error: 'Subject name is required'
-    });
+    return res.status(400).json({ error: 'Subject name is required' });
   }
 
-  const parsedTeacherId =
-    teacher_id && String(teacher_id).trim() !== ''
-      ? parseInt(teacher_id, 10)
-      : null;
-
-  const parsedSemesterId =
-    semester_id && String(semester_id).trim() !== ''
-      ? parseInt(semester_id, 10)
-      : null;
+  const parsedTeacherId = teacher_id && String(teacher_id).trim() !== '' ? parseInt(teacher_id, 10) : null;
+  const parsedSemesterId = semester_id && String(semester_id).trim() !== '' ? parseInt(semester_id, 10) : null;
 
   try {
-    const result = db.prepare(`
-      INSERT INTO SUBJECT (
-        subject_name,
-        teacher_ID,
-        semester_ID
-      )
-      VALUES (?, ?, ?)
-    `).run(
-      subject_name.trim(),
-      parsedTeacherId,
-      parsedSemesterId
-    );
+    const { data, error } = await db
+      .from('SUBJECT')
+      .insert({
+        subject_name: subject_name.trim(),
+        teacher_ID: parsedTeacherId,
+        semester_ID: parsedSemesterId
+      })
+      .select()
+      .single();
 
-    res.status(201).json({
-      message: 'Subject created successfully',
-      id: result.lastInsertRowid
-    });
+    if (error) throw error;
 
+    res.status(201).json({ message: 'Subject created successfully', id: data.sub_ID });
   } catch (err) {
     console.error('Create subject error:', err.message);
-
-    res.status(400).json({
-      error: err.message
-    });
+    res.status(400).json({ error: err.message });
   }
 });
 
-router.put('/subjects/:id', (req, res) => {
+router.put('/subjects/:id', async (req, res) => {
   const subId = parseInt(req.params.id, 10);
   const { teacher_id } = req.body;
-
-  const parsedTeacherId = teacher_id && String(teacher_id).trim() !== '' 
-    ? parseInt(teacher_id, 10) 
-    : null;
+  const parsedTeacherId = teacher_id && String(teacher_id).trim() !== '' ? parseInt(teacher_id, 10) : null;
 
   try {
-    db.prepare('UPDATE SUBJECT SET teacher_ID = ? WHERE sub_ID = ?').run(parsedTeacherId, subId);
+    const { error } = await db
+      .from('SUBJECT')
+      .update({ teacher_ID: parsedTeacherId })
+      .eq('sub_ID', subId);
+
+    if (error) throw error;
     res.json({ message: 'Subject assignment updated' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -512,108 +411,86 @@ router.put('/subjects/:id', (req, res) => {
 // -------------------------------------------------------------
 // GET ACTIVE SEMESTERS
 // -------------------------------------------------------------
-router.get('/semesters', (req, res) => {
+router.get('/semesters', async (req, res) => {
   try {
-    const semesters = db.prepare(`
-      SELECT
-        semester_ID AS id,
-        semester_name,
-        start_date,
-        end_date,
-        status
-      FROM SEMESTERS
-      WHERE status = 1
-      ORDER BY start_date DESC
-    `).all();
+    const { data: semesters, error } = await db
+      .from('SEMESTERS')
+      .select('semester_ID, semester_name, start_date, end_date, status')
+      .eq('status', 1)
+      .order('start_date', { ascending: false });
 
-    res.json(semesters);
+    if (error) throw error;
 
+    res.json((semesters || []).map(s => ({
+      id: s.semester_ID,
+      semester_name: s.semester_name,
+      start_date: s.start_date,
+      end_date: s.end_date,
+      status: s.status
+    })));
   } catch (err) {
     console.error('Fetch semesters error:', err.message);
-    res.status(500).json({
-      error: err.message
-    });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// -------------------------------------------------------------
-// CREATE SEMESTER
-// -------------------------------------------------------------
-router.post('/semesters', (req, res) => {
-  const {
-    semester_name,
-    start_date,
-    end_date
-  } = req.body;
+router.post('/semesters', async (req, res) => {
+  const { semester_name, start_date, end_date } = req.body;
 
   if (!semester_name || !start_date || !end_date) {
-    return res.status(400).json({
-      error: 'Semester name, start date, and end date are required'
-    });
+    return res.status(400).json({ error: 'Semester name, start date, and end date are required' });
   }
 
   if (new Date(start_date) >= new Date(end_date)) {
-    return res.status(400).json({
-      error: 'End date must be after start date'
-    });
+    return res.status(400).json({ error: 'End date must be after start date' });
   }
 
   try {
-    const result = db.prepare(`
-      INSERT INTO SEMESTERS (
-        semester_name,
+    const { data, error } = await db
+      .from('SEMESTERS')
+      .insert({
+        semester_name: semester_name.trim(),
         start_date,
         end_date,
-        status
-      )
-      VALUES (?, ?, ?, 1)
-    `).run(
-      semester_name.trim(),
-      start_date,
-      end_date
-    );
+        status: 1
+      })
+      .select()
+      .single();
 
-    res.status(201).json({
-      message: 'Semester created successfully',
-      id: result.lastInsertRowid
-    });
+    if (error) throw error;
 
+    res.status(201).json({ message: 'Semester created successfully', id: data.semester_ID });
   } catch (err) {
     console.error('Create semester error:', err.message);
-
-    res.status(400).json({
-      error: err.message
-    });
+    res.status(400).json({ error: err.message });
   }
 });
 
 // -------------------------------------------------------------
 // 5. STUDENTS & BIOMETRIC_TEMP ENROLLMENT
 // -------------------------------------------------------------
-router.get('/students', (req, res) => {
+router.get('/students', async (req, res) => {
   try {
-    const students = db.prepare(`
-      SELECT 
-        stu_ID as id, 
-        roll_no,
-        name, 
-        CASE 
-          WHEN biometric_temp IS NOT NULL 
-               AND biometric_temp != 'PENDING_ENROLLMENT' 
-               AND LENGTH(biometric_temp) > 0 
-          THEN 1 ELSE 0 
-        END as has_fingerprint 
-      FROM STUDENTS
-      ORDER BY stu_ID ASC
-    `).all();
-    res.json(students);
+    const { data: students, error } = await db
+      .from('STUDENTS')
+      .select('stu_ID, roll_no, name, biometric_temp')
+      .order('stu_ID', { ascending: true });
+
+    if (error) throw error;
+
+    res.json((students || []).map(s => ({
+      id: s.stu_ID,
+      roll_no: s.roll_no,
+      name: s.name,
+      has_fingerprint: (s.biometric_temp && s.biometric_temp !== 'PENDING_ENROLLMENT' && s.biometric_temp.length > 0) ? 1 : 0
+    })));
   } catch (err) {
     console.error('Fetch students error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-router.post('/students', (req, res) => {
+router.post('/students', async (req, res) => {
   const { roll_no, name, biometric_template } = req.body;
 
   if (!name || !roll_no) {
@@ -625,22 +502,26 @@ router.post('/students', (req, res) => {
     : 'PENDING_ENROLLMENT';
 
   try {
-    const result = db.prepare(`
-      INSERT INTO STUDENTS (roll_no, name, biometric_temp) 
-      VALUES (?, ?, ?)
-    `).run(roll_no.trim(), name.trim(), templatePayload);
+    const { data, error } = await db
+      .from('STUDENTS')
+      .insert({
+        roll_no: roll_no.trim(),
+        name: name.trim(),
+        biometric_temp: templatePayload
+      })
+      .select()
+      .single();
 
-    res.status(201).json({ 
-      message: 'Student registered successfully', 
-      id: result.lastInsertRowid 
-    });
+    if (error) throw error;
+
+    res.status(201).json({ message: 'Student registered successfully', id: data.stu_ID });
   } catch (err) {
     console.error('Register student error:', err.message);
     res.status(400).json({ error: err.message });
   }
 });
 
-router.put('/students/:id/biometrics', (req, res) => {
+router.put('/students/:id/biometrics', async (req, res) => {
   const stuId = parseInt(req.params.id, 10);
   const { biometric_template } = req.body;
 
@@ -649,7 +530,12 @@ router.put('/students/:id/biometrics', (req, res) => {
   }
 
   try {
-    db.prepare('UPDATE STUDENTS SET biometric_temp = ? WHERE stu_ID = ?').run(biometric_template, stuId);
+    const { error } = await db
+      .from('STUDENTS')
+      .update({ biometric_temp: biometric_template })
+      .eq('stu_ID', stuId);
+
+    if (error) throw error;
     res.json({ message: 'Fingerprint enrolled successfully' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -659,50 +545,57 @@ router.put('/students/:id/biometrics', (req, res) => {
 // -------------------------------------------------------------
 // 6. ENROLLMENTS (STUDENT-SUBJECT JUNCTION)
 // -------------------------------------------------------------
-router.get('/enrollments', (req, res) => {
+router.get('/enrollments', async (req, res) => {
   try {
-    const enrollments = db.prepare(`
-      SELECT 
-        e.enroll_ID as id,
-        e.stu_ID as student_id,
-        st.roll_no,
-        st.name as student_name,
-        e.sub_ID as subject_id,
-        sub.subject_name
-      FROM ENROLLMENTS e
-      LEFT JOIN STUDENTS st ON e.stu_ID = st.stu_ID
-      LEFT JOIN SUBJECT sub ON e.sub_ID = sub.sub_ID
-      ORDER BY e.enroll_ID DESC
-    `).all();
+    const { data: enrollments, error } = await db
+      .from('ENROLLMENTS')
+      .select('enroll_ID, stu_ID, sub_ID, STUDENTS(roll_no, name), SUBJECT(subject_name)')
+      .order('enroll_ID', { ascending: false });
 
-    res.json(enrollments);
+    if (error) throw error;
+
+    res.json((enrollments || []).map(e => ({
+      id: e.enroll_ID,
+      student_id: e.stu_ID,
+      roll_no: e.STUDENTS?.roll_no,
+      student_name: e.STUDENTS?.name,
+      subject_id: e.sub_ID,
+      subject_name: e.SUBJECT?.subject_name
+    })));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-router.post('/enrollments', (req, res) => {
+router.post('/enrollments', async (req, res) => {
   const { student_id, subject_id } = req.body;
   if (!student_id || !subject_id) {
     return res.status(400).json({ error: 'Select both a student and a subject' });
   }
 
   try {
-    const result = db.prepare(`
-      INSERT INTO ENROLLMENTS (stu_ID, sub_ID) 
-      VALUES (?, ?)
-    `).run(parseInt(student_id, 10), parseInt(subject_id, 10));
+    const { data, error } = await db
+      .from('ENROLLMENTS')
+      .insert({
+        stu_ID: parseInt(student_id, 10),
+        sub_ID: parseInt(subject_id, 10)
+      })
+      .select()
+      .single();
 
-    res.status(201).json({ message: 'Student enrolled successfully', id: result.lastInsertRowid });
+    if (error) throw error;
+
+    res.status(201).json({ message: 'Student enrolled successfully', id: data.enroll_ID });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
 });
 
-router.delete('/enrollments/:id', (req, res) => {
+router.delete('/enrollments/:id', async (req, res) => {
   const enrollId = parseInt(req.params.id, 10);
   try {
-    db.prepare('DELETE FROM ENROLLMENTS WHERE enroll_ID = ?').run(enrollId);
+    const { error } = await db.from('ENROLLMENTS').delete().eq('enroll_ID', enrollId);
+    if (error) throw error;
     res.json({ message: 'Enrollment removed successfully' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -712,69 +605,72 @@ router.delete('/enrollments/:id', (req, res) => {
 // -------------------------------------------------------------
 // 7. DEVICES (ESP32)
 // -------------------------------------------------------------
-router.get('/devices', (req, res) => {
+router.get('/devices', async (req, res) => {
   try {
-    const devices = db.prepare(`
-      SELECT 
-        device_ID as id, 
-        mac_address, 
-        auth_token, 
-        status 
-      FROM DEVICES
-    `).all();
-    res.json(devices);
+    const { data: devices, error } = await db
+      .from('DEVICES')
+      .select('device_ID, mac_address, auth_token, status');
+
+    if (error) throw error;
+
+    res.json((devices || []).map(d => ({
+      id: d.device_ID,
+      mac_address: d.mac_address,
+      auth_token: d.auth_token,
+      status: d.status
+    })));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-router.post('/devices', (req, res) => {
+router.post('/devices', async (req, res) => {
   const { mac_address, auth_token, status } = req.body;
   if (!mac_address) {
     return res.status(400).json({ error: 'MAC address is required' });
   }
 
-  const deviceStatus = status !== undefined && status !== '' ? parseInt(status, 10) : 1; // 1 = Active
+  const deviceStatus = status !== undefined && status !== '' ? parseInt(status, 10) : 1;
   const token = auth_token || `TOKEN_${Date.now()}`;
 
   try {
-    const result = db.prepare(`
-      INSERT INTO DEVICES (mac_address, auth_token, status) 
-      VALUES (?, ?, ?)
-    `).run(mac_address, token, deviceStatus);
+    const { data, error } = await db
+      .from('DEVICES')
+      .insert({ mac_address, auth_token: token, status: deviceStatus })
+      .select()
+      .single();
 
-    res.status(201).json({ message: 'Device registered successfully', id: result.lastInsertRowid });
+    if (error) throw error;
+
+    res.status(201).json({ message: 'Device registered successfully', id: data.device_ID });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
 });
 
 // -------------------------------------------------------------
-// 8. ADMIN MANAGEMENT (ADD / LIST / DELETE OTHER ADMINS)
+// 8. ADMIN MANAGEMENT
 // -------------------------------------------------------------
-
-// Get all admins (exclude password hashes)
-router.get('/admins', (req, res) => {
+router.get('/admins', async (req, res) => {
   try {
-    // 1. Get any other sub-admins from DB (if any)
     let dbAdmins = [];
     try {
-      dbAdmins = db.prepare(
-        'SELECT admin_ID, name, email FROM ADMIN WHERE LOWER(email) != LOWER(?)'
-      ).all(SUPER_ADMIN.email);
+      const { data, error } = await db
+        .from('ADMIN')
+        .select('admin_ID, name, email')
+        .neq('email', SUPER_ADMIN.email);
+      if (!error && data) dbAdmins = data;
     } catch (e) {
-      // If ADMIN table is dropped or empty, dbAdmins remains []
       dbAdmins = [];
     }
 
-    const formattedDbAdmins = dbAdmins.map((a) => ({
+    const formattedDbAdmins = dbAdmins.map(a => ({
       id: a.admin_ID,
       name: a.name,
       email: a.email,
       isSuper: false
     }));
 
-    // 2. Put Super Admin permanently at top (ID 1)
     const allAdmins = [
       {
         id: SUPER_ADMIN.id,
@@ -792,8 +688,7 @@ router.get('/admins', (req, res) => {
   }
 });
 
-// Add a new admin
-router.post('/admins', (req, res) => {
+router.post('/admins', async (req, res) => {
   const { name, email, password } = req.body;
   if (!name || !email || !password) {
     return res.status(400).json({ error: 'Name, email, and password are required' });
@@ -801,71 +696,65 @@ router.post('/admins', (req, res) => {
 
   try {
     const hash = bcrypt.hashSync(password, 10);
-    const result = db.prepare(`
-      INSERT INTO ADMIN (name, email, pass_hash) 
-      VALUES (?, ?, ?)
-    `).run(name, email, hash);
+    const { data, error } = await db
+      .from('ADMIN')
+      .insert({ name, email, pass_hash: hash })
+      .select()
+      .single();
 
-    res.status(201).json({ message: 'Admin added successfully', id: result.lastInsertRowid });
+    if (error) throw error;
+
+    res.status(201).json({ message: 'Admin added successfully', id: data.admin_ID });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
 });
 
-// Delete an admin (with self-deletion check)
-router.delete('/admins/:id', (req, res) => {
+router.delete('/admins/:id', async (req, res) => {
   const targetId = parseInt(req.params.id, 10);
 
-  // Prevent a normal admin from deleting their own account
   if (!req.admin.isSuper && req.admin.id === targetId) {
-    return res.status(400).json({
-      error: 'You cannot delete your own active administrator account.'
-    });
+    return res.status(400).json({ error: 'You cannot delete your own active administrator account.' });
   }
 
   try {
-    const result = db
-      .prepare('DELETE FROM ADMIN WHERE admin_ID = ?')
-      .run(targetId);
+    const { data, error } = await db
+      .from('ADMIN')
+      .delete()
+      .eq('admin_ID', targetId)
+      .select();
 
-    if (result.changes === 0) {
-      return res.status(404).json({
-        error: 'Admin account not found in database.'
-      });
+    if (error) throw error;
+
+    if (!data || data.length === 0) {
+      return res.status(404).json({ error: 'Admin account not found in database.' });
     }
 
-    res.json({
-      message: 'Administrator account deleted successfully.'
-    });
-
+    res.json({ message: 'Administrator account deleted successfully.' });
   } catch (err) {
-    res.status(500).json({
-      error: err.message
-    });
+    res.status(500).json({ error: err.message });
   }
 });
 
 // -------------------------------------------------------------
 // 9. TRIGGER FINGERPRINT ENROLLMENT (BRIDGE)
 // -------------------------------------------------------------
-
-// In-memory holder for the pending hardware command (or store in a lightweight DB table)
-let pendingEnrollmentCommand = null;
-
-router.post('/students/:id/trigger-enroll', (req, res) => {
+router.post('/students/:id/trigger-enroll', async (req, res) => {
   const stuId = parseInt(req.params.id, 10);
   const { roll_no } = req.body;
 
   try {
-    const student = db
-      .prepare('SELECT * FROM STUDENTS WHERE stu_ID = ?')
-      .get(stuId);
+    const { data: student, error } = await db
+      .from('STUDENTS')
+      .select('*')
+      .eq('stu_ID', stuId)
+      .maybeSingle();
 
+    if (error) throw error;
     if (!student) {
       return res.status(404).json({ error: 'Student not found' });
     }
 
-    // Create a pending enrollment request for the ESP32
     pendingEnrollmentCommand = {
       action: 'enroll',
       studentId: stuId,
@@ -873,26 +762,17 @@ router.post('/students/:id/trigger-enroll', (req, res) => {
       timestamp: Date.now()
     };
 
-    console.log(
-      `Enrollment request created for student ID #${stuId}`
-    );
-
-    res.json({
-      message: `Enrollment request created for student ID #${stuId}.`
-    });
-
+    console.log(`Enrollment request created for student ID #${stuId}`);
+    res.json({ message: `Enrollment request created for student ID #${stuId}.` });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Endpoint for ESP32 or a bridge helper to check if there's a pending enrollment job
 router.get('/hardware/pending-command', (req, res) => {
-  // Clear command after it's fetched once so it doesn't loop forever
   const cmd = pendingEnrollmentCommand;
-  pendingEnrollmentCommand = null; 
+  pendingEnrollmentCommand = null;
   res.json(cmd || { action: 'none' });
 });
-
 
 module.exports = router;

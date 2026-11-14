@@ -1,19 +1,22 @@
-const Database = require('better-sqlite3');
+const { createClient } = require('@supabase/supabase-js');
 const path = require('path');
+const dotenv = require('dotenv');
 
-const db = new Database(path.join(__dirname, 'smartAttend.db')); // or smartAttend_2.db
+// Load environment variables
+dotenv.config({ path: path.join(__dirname, '.env') });
 
-console.log(
-  'ATTENDANCE schema:',
-  db.prepare("PRAGMA table_info('ATTENDANCE')").all()
-);
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SECRET_KEY;
 
-// --- AUTOMATIC SCHEMA MIGRATION ---
-const studentCols = db.prepare("PRAGMA table_info('STUDENTS')").all().map(c => c.name);
-
-if (!studentCols.includes('roll_no')) {
-  db.prepare("ALTER TABLE STUDENTS ADD COLUMN roll_no TEXT").run();
-  console.log("Migration Successful: Added 'roll_no' column to STUDENTS table.");
+if (!supabaseUrl || !supabaseKey) {
+  console.warn('[WARNING] Missing SUPABASE_URL or SUPABASE_SECRET_KEY in environment variables!');
 }
 
-module.exports = db;
+const supabase = createClient(supabaseUrl, supabaseKey, {
+  auth: {
+    persistSession: false,
+    autoRefreshToken: false
+  }
+});
+
+module.exports = supabase;

@@ -9,19 +9,14 @@ const {
   verifyDeviceApiKey
 } = require('../middleware/auth');
 
-
 // =============================================================
 // MARK ATTENDANCE FROM ESP32
 // =============================================================
 
-router.post('/mark', verifyDeviceApiKey, (req, res) => {
-
+router.post('/mark', verifyDeviceApiKey, async (req, res) => {
   const { fingerprintId } = req.body;
 
-  // -----------------------------------------------------------
   // 1. Validate fingerprint ID
-  // -----------------------------------------------------------
-
   if (!fingerprintId) {
     return res.status(400).json({
       error: 'Fingerprint ID is required'
@@ -29,23 +24,16 @@ router.post('/mark', verifyDeviceApiKey, (req, res) => {
   }
 
   try {
-
-    // ---------------------------------------------------------
     // 2. Find currently active attendance session
-    // ---------------------------------------------------------
+    const { data: session, error: sessionErr } = await db
+      .from('SESSIONS')
+      .select('session_ID, sub_ID, device_ID')
+      .eq('status', 1)
+      .order('session_ID', { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
-    const session = db.prepare(`
-      SELECT
-        session_ID,
-        sub_ID,
-        device_ID
-      FROM SESSIONS
-      WHERE status = 1
-        AND datetime('now', 'localtime') >= datetime(start_time)
-        AND datetime('now', 'localtime') <= datetime(end_time)
-      ORDER BY session_ID DESC
-      LIMIT 1
-    `).get();
+    if (sessionErr) throw sessionErr;
 
     if (!session) {
       return res.status(404).json({
@@ -54,32 +42,17 @@ router.post('/mark', verifyDeviceApiKey, (req, res) => {
       });
     }
 
-
-    // ---------------------------------------------------------
-    // 3. TEST MAPPING
-    //
-    // For this first test only:
-    // AS608 slot #16 -> Student ID 16
-    //
-    // We will replace this with proper temporary
-    // slot-to-student mapping later.
-    // ---------------------------------------------------------
-
+    // 3. Mapping: fingerprint ID -> Student ID
     const studentId = parseInt(fingerprintId, 10);
 
-
-    // ---------------------------------------------------------
     // 4. Find student
-    // ---------------------------------------------------------
+    const { data: student, error: studentErr } = await db
+      .from('STUDENTS')
+      .select('stu_ID, name, roll_no')
+      .eq('stu_ID', studentId)
+      .maybeSingle();
 
-    const student = db.prepare(`
-      SELECT
-        stu_ID,
-        name,
-        roll_no
-      FROM STUDENTS
-      WHERE stu_ID = ?
-    `).get(studentId);
+    if (studentErr) throw studentErr;
 
     if (!student) {
       return res.status(404).json({
@@ -88,57 +61,38 @@ router.post('/mark', verifyDeviceApiKey, (req, res) => {
       });
     }
 
-
-    // ---------------------------------------------------------
     // 5. Check whether attendance is already marked
-    // ---------------------------------------------------------
+    const { data: existingAttendance, error: existErr } = await db
+      .from('ATTENDANCE')
+      .select('status')
+      .eq('session_ID', session.session_ID)
+      .eq('stu_ID', student.stu_ID)
+      .maybeSingle();
 
-    const existingAttendance = db.prepare(`
-        SELECT
-            status
-        FROM ATTENDANCE
-        WHERE session_ID = ?
-            AND stu_ID = ?
-        `).get(
-        session.session_ID,
-        student.stu_ID
-        );
+    if (existErr) throw existErr;
 
     if (existingAttendance) {
-
       return res.json({
         status: 'already_marked',
         studentId: student.stu_ID,
         studentName: student.name,
         sessionId: session.session_ID
       });
-
     }
 
-
-    // ---------------------------------------------------------
     // 6. Insert attendance
-    // ---------------------------------------------------------
+    const { error: insertErr } = await db
+      .from('ATTENDANCE')
+      .insert({
+        session_ID: session.session_ID,
+        stu_ID: student.stu_ID,
+        time_stamp: new Date().toISOString(),
+        status: 'Present'
+      });
 
-    db.prepare(`
-      INSERT INTO ATTENDANCE (
-        session_ID,
-        stu_ID,
-        time_stamp,
-        status
-      )
-      VALUES (?, ?, datetime('now', 'localtime'), ?)
-    `).run(
-      session.session_ID,
-      student.stu_ID,
-      'Present'
-    );
+    if (insertErr) throw insertErr;
 
-
-    // ---------------------------------------------------------
     // 7. Success response
-    // ---------------------------------------------------------
-
     console.log(
       `[ATTENDANCE] Student ${student.stu_ID} (${student.name}) marked Present for session ${session.session_ID}`
     );
@@ -150,21 +104,12 @@ router.post('/mark', verifyDeviceApiKey, (req, res) => {
       sessionId: session.session_ID
     });
 
-
   } catch (err) {
-
-    console.error(
-      '[ATTENDANCE] Mark attendance error:',
-      err.message
-    );
-
+    console.error('[ATTENDANCE] Mark attendance error:', err.message);
     return res.status(500).json({
       error: err.message
     });
-
   }
-
 });
-
 
 module.exports = router;
