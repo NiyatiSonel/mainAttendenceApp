@@ -37,12 +37,16 @@ async function sendResetOtpEmail({ to, name, otp, role }) {
     };
   }
 
+  // Clean user and remove any spaces from app password
+  const cleanUser = emailUser.trim();
+  const cleanPass = emailPass.replace(/\s+/g, '');
+
   // Create transporter
   const transporter = nodemailer.createTransport({
     service: emailService,
     auth: {
-      user: emailUser,
-      pass: emailPass
+      user: cleanUser,
+      pass: cleanPass
     }
   });
 
@@ -78,7 +82,7 @@ async function sendResetOtpEmail({ to, name, otp, role }) {
 
   try {
     await transporter.sendMail({
-      from: `"SmartAttend Security" <${emailUser}>`,
+      from: `"SmartAttend Security" <${cleanUser}>`,
       to,
       subject: `[SmartAttend] Password Reset Verification Code: ${otp}`,
       html: htmlContent
@@ -90,7 +94,13 @@ async function sendResetOtpEmail({ to, name, otp, role }) {
     };
   } catch (error) {
     console.error('Error sending reset email:', error);
-    throw new Error('Failed to send verification email. Please check server email configuration.');
+    let errorDetail = 'Failed to send verification email. Please check server email configuration.';
+    if (error.code === 'EAUTH' || (error.message && error.message.includes('Invalid login'))) {
+      errorDetail = 'Gmail authentication failed (EAUTH): Please ensure EMAIL_PASS is a 16-character Google App Password (not your regular Gmail password) and 2-Step Verification is ON.';
+    } else if (error.message) {
+      errorDetail = `Email delivery error: ${error.message}`;
+    }
+    throw new Error(errorDetail);
   }
 }
 
