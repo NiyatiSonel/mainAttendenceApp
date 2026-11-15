@@ -8,6 +8,7 @@ const {
   verifyAdminToken,
   verifyDeviceApiKey
 } = require('../middleware/auth');
+const { sendResetOtpEmail } = require('../utils/mailer');
 
 // Helper to decode hex strings (e.g. \x445341...) if columns were stored as BYTEA
 function decodeHexIfNeeded(str) {
@@ -179,6 +180,126 @@ router.post('/login', async (req, res) => {
   } catch (err) {
     console.error('Admin login error:', err.message);
     return res.status(500).json({ error: err.message });
+  }
+});
+
+// -------------------------------------------------------------
+// ADMIN FORGOT PASSWORD - REQUEST OTP
+// -------------------------------------------------------------
+router.post('/forgot-password', async (req, res) => {
+  const { email } = req.body;
+
+  if (!email || !email.trim()) {
+    return res.status(400).json({ error: 'Email address is required' });
+  }
+
+  const cleanEmail = email.trim().toLowerCase();
+
+  // Protect Super Admin root account
+  if (cleanEmail === SUPER_ADMIN.email.toLowerCase()) {
+    return res.status(403).json({
+      error: 'The Super Administrator account is configured directly on the server (.env). To change its credentials, update SUPER_ADMIN_PASSWORD in your server environment variables.'
+    });
+  }
+
+  try {
+    const { data: admin, error } = await db
+      .from('ADMIN')
+      .select('admin_ID, name, email')
+      .ilike('email', cleanEmail)
+      .maybeSingle();
+
+    if (error) throw error;
+
+    if (!admin) {
+      return res.status(404).json({ error: 'No administrator account found with this email address.' });
+    }
+
+    // Generate cryptographically random 6-digit OTP
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const otpHash = bcrypt.hashSync(otp, 8);
+
+    // Sign stateless reset token valid for 10 minutes (serverless-friendly)
+    const resetToken = jwt.sign(
+      { id: admin.admin_ID, email: admin.email, role: 'admin', otpHash, type: 'reset_token' },
+      process.env.JWT_SECRET,
+      { expiresIn: '10m' }
+    );
+
+    // Send email or log to console
+    const mailResult = await sendResetOtpEmail({
+      to: admin.email,
+      name: admin.name,
+      otp,
+      role: 'admin'
+    });
+
+    return res.json({
+      success: true,
+      message: mailResult.message,
+      resetToken,
+      email: admin.email,
+      devOtp: mailResult.otp
+    });
+  } catch (err) {
+    console.error('Admin forgot password error:', err.message);
+    return res.status(500).json({ error: err.message || 'Failed to process password reset request.' });
+  }
+});
+
+// -------------------------------------------------------------
+// ADMIN RESET PASSWORD - VERIFY OTP & UPDATE
+// -------------------------------------------------------------
+router.post('/reset-password', async (req, res) => {
+  const { resetToken, otp, newPassword } = req.body;
+
+  if (!resetToken) {
+    return res.status(400).json({ error: 'Verification session missing. Please request a new code.' });
+  }
+
+  if (!otp || !otp.toString().trim()) {
+    return res.status(400).json({ error: '6-digit verification code is required.' });
+  }
+
+  if (!newPassword || newPassword.length < 6) {
+    return res.status(400).json({ error: 'New password must be at least 6 characters long.' });
+  }
+
+  try {
+    let decoded;
+    try {
+      decoded = jwt.verify(resetToken, process.env.JWT_SECRET);
+    } catch (err) {
+      return res.status(400).json({ error: 'Verification session has expired or is invalid. Please request a new code.' });
+    }
+
+    if (decoded.type !== 'reset_token' || decoded.role !== 'admin') {
+      return res.status(400).json({ error: 'Invalid reset token format.' });
+    }
+
+    // Verify OTP matches hash
+    const isMatch = bcrypt.compareSync(otp.toString().trim(), decoded.otpHash);
+    if (!isMatch) {
+      return res.status(400).json({ error: 'Invalid verification code. Please check and try again.' });
+    }
+
+    // Hash new password and update in Supabase
+    const newHash = bcrypt.hashSync(newPassword, 10);
+
+    const { error: updateErr } = await db
+      .from('ADMIN')
+      .update({ pass_hash: newHash })
+      .eq('admin_ID', decoded.id);
+
+    if (updateErr) throw updateErr;
+
+    return res.json({
+      success: true,
+      message: 'Password reset successfully! You can now log in with your new password.'
+    });
+  } catch (err) {
+    console.error('Admin reset password error:', err.message);
+    return res.status(500).json({ error: err.message || 'Failed to reset password.' });
   }
 });
 

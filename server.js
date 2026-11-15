@@ -1,62 +1,65 @@
+
+//require('dotenv').config();
 const path = require('path');
 const fs = require('fs');
 const dotenv = require('dotenv');
 
 const envPath = path.join(__dirname, '.env');
-dotenv.config({ path: envPath });
 
-console.log('JWT SECRET EXISTS:', !!process.env.JWT_SECRET);
-console.log('SUPABASE URL EXISTS:', !!process.env.SUPABASE_URL);
+console.log('Looking for .env at:', envPath);
+console.log('.env exists:', fs.existsSync(envPath));
+
+const result = dotenv.config({ path: envPath });
 
 const express = require('express');
 const cors = require('cors');
 
+//----------------
+console.log('ENV FILE:', path.join(__dirname, '.env'));
+console.log('JWT SECRET LOADED:', !!process.env.JWT_SECRET);
+//-----------------
+
+
 const adminRoutes = require('./routes/admin');
 const attendanceRoutes = require('./routes/attendance');
-const teacherRoutes = require('./routes/teacher');
 
 const app = express();
 
 // Middlewares
 app.use(cors({
-  origin: '*',
+  origin: '*', // Adjust this to your frontend's URL
 }));
 app.use(express.json());
-
-// Restore original requested URL if rewritten by Vercel serverless
-app.use((req, res, next) => {
-  const originalUrl = req.headers['x-matched-path'] || req.headers['x-forwarded-url'];
-  if (originalUrl) {
-    req.url = originalUrl;
-  }
-  next();
-});
 
 // Health route
 app.get('/api/health', (req, res) => {
   res.json({ status: 'running', timestamp: new Date().toISOString() });
 });
 
-// Root route
-app.get('/', (req, res) => {
-  res.json({
-    status: 'running',
-    timestamp: new Date().toISOString()
-  });
-});
-
-// Mount Routes
+// Mount Admin Routes
 app.use('/api/admin', adminRoutes);
 app.use('/api/attendance', attendanceRoutes);
-app.use('/api/teacher', teacherRoutes);
 
 const PORT = process.env.PORT || 5000;
 
-// Start server locally (Vercel invokes the exported app handler)
-if (!process.env.VERCEL) {
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Central Server listening on port ${PORT}`);
-  });
-}
+// Backend Health/status route
+app.get('/', (req, res) => {
+    res.json({
+        status: 'running',
+        timestamp: new Date().toISOString()
+    });
+});
+
+// Start the server
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Central Server listening on port ${PORT}`);
+  console.log(`Network API: http://10.63.14.66:${PORT}`);
+});
+
+// Add with your existing route imports
+const teacherRoutes = require('./routes/teacher');
+
+// Mount under /api/teacher
+app.use('/api/teacher', teacherRoutes);
 
 module.exports = app;

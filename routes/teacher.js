@@ -4,6 +4,7 @@ const db = require('../db');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { verifyTeacherToken } = require('../middleware/teacherAuth');
+const { sendResetOtpEmail } = require('../utils/mailer');
 
 // Helper to decode hex strings (e.g. \x445341...) if columns were stored as BYTEA
 function decodeHexIfNeeded(str) {
@@ -63,6 +64,119 @@ router.post('/login', async (req, res) => {
   } catch (err) {
     console.error('Teacher login error:', err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// -------------------------------------------------------------
+// TEACHER FORGOT PASSWORD - REQUEST OTP
+// -------------------------------------------------------------
+router.post('/forgot-password', async (req, res) => {
+  const { email } = req.body;
+
+  if (!email || !email.trim()) {
+    return res.status(400).json({ error: 'Email address is required' });
+  }
+
+  const cleanEmail = email.trim().toLowerCase();
+
+  try {
+    const { data: teacher, error } = await db
+      .from('TEACHER')
+      .select('teacher_ID, name, email')
+      .ilike('email', cleanEmail)
+      .maybeSingle();
+
+    if (error) throw error;
+
+    if (!teacher) {
+      return res.status(404).json({ error: 'No teacher account found with this email address.' });
+    }
+
+    // Generate cryptographically random 6-digit OTP
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const otpHash = bcrypt.hashSync(otp, 8);
+
+    // Sign stateless reset token valid for 10 minutes (serverless-friendly)
+    const resetToken = jwt.sign(
+      { id: teacher.teacher_ID, email: teacher.email, role: 'teacher', otpHash, type: 'reset_token' },
+      process.env.JWT_SECRET,
+      { expiresIn: '10m' }
+    );
+
+    // Send email or log to console
+    const mailResult = await sendResetOtpEmail({
+      to: teacher.email,
+      name: teacher.name,
+      otp,
+      role: 'teacher'
+    });
+
+    return res.json({
+      success: true,
+      message: mailResult.message,
+      resetToken,
+      email: teacher.email,
+      devOtp: mailResult.otp
+    });
+  } catch (err) {
+    console.error('Teacher forgot password error:', err.message);
+    return res.status(500).json({ error: err.message || 'Failed to process password reset request.' });
+  }
+});
+
+// -------------------------------------------------------------
+// TEACHER RESET PASSWORD - VERIFY OTP & UPDATE
+// -------------------------------------------------------------
+router.post('/reset-password', async (req, res) => {
+  const { resetToken, otp, newPassword } = req.body;
+
+  if (!resetToken) {
+    return res.status(400).json({ error: 'Verification session missing. Please request a new code.' });
+  }
+
+  if (!otp || !otp.toString().trim()) {
+    return res.status(400).json({ error: '6-digit verification code is required.' });
+  }
+
+  if (!newPassword || newPassword.length < 6) {
+    return res.status(400).json({ error: 'New password must be at least 6 characters long.' });
+  }
+
+  try {
+    let decoded;
+    try {
+      decoded = jwt.verify(resetToken, process.env.JWT_SECRET);
+    } catch (err) {
+      return res.status(400).json({ error: 'Verification session has expired or is invalid. Please request a new code.' });
+    }
+
+    if (decoded.type !== 'reset_token' || decoded.role !== 'teacher') {
+      return res.status(400).json({ error: 'Invalid reset token format.' });
+    }
+
+    // Verify OTP matches hash
+    const isMatch = bcrypt.compareSync(otp.toString().trim(), decoded.otpHash);
+    if (!isMatch) {
+      return res.status(400).json({ error: 'Invalid verification code. Please check and try again.' });
+    }
+
+    // Hash new password and update in Supabase
+    const newHash = bcrypt.hashSync(newPassword, 10);
+
+    const { error: updateErr } = await db
+      .from('TEACHER')
+      .update({ pass_hash: newHash })
+      .eq('teacher_ID', decoded.id);
+
+    if (updateErr) throw updateErr;
+
+    return res.json({
+      success: true,
+      message: 'Password reset successfully! You can now log in with your new password.'
+    });
+  } catch (err) {
+    console.error('Teacher reset password error:', err.message);
+    return res.status(500).json({ error: err.message || 'Failed to reset password.' });
   }
 });
 
