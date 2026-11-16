@@ -633,8 +633,8 @@ router.post('/sessions/start', async (req, res) => {
       .eq('teacher_ID', teacherId)
       .eq('status', 1);
 
-    // Insert new session
-    const { data: newSession, error: insertErr } = await db
+    // Insert new session (with fallback if primary key sequence is out of sync)
+    let { data: newSession, error: insertErr } = await db
       .from('SESSIONS')
       .insert({
         teacher_ID: teacherId,
@@ -646,6 +646,36 @@ router.post('/sessions/start', async (req, res) => {
       })
       .select()
       .single();
+
+    // If PostgreSQL sequence is desynchronized, compute next session_ID manually
+    if (insertErr && (insertErr.message?.includes('SESSIONS_pkey') || insertErr.code === '23505')) {
+      console.warn('SESSIONS_pkey collision detected. Calculating next available session_ID manually...');
+      const { data: maxRow } = await db
+        .from('SESSIONS')
+        .select('session_ID')
+        .order('session_ID', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      const nextSessionId = (maxRow?.session_ID || 0) + 1;
+
+      const retryResult = await db
+        .from('SESSIONS')
+        .insert({
+          session_ID: nextSessionId,
+          teacher_ID: teacherId,
+          device_ID: parseInt(device_id, 10),
+          sub_ID: parseInt(subject_id, 10),
+          start_time,
+          end_time,
+          status: 1
+        })
+        .select()
+        .single();
+
+      newSession = retryResult.data;
+      insertErr = retryResult.error;
+    }
 
     if (insertErr) throw insertErr;
 
