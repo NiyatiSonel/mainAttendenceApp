@@ -81,7 +81,7 @@ router.post('/mark', verifyDeviceApiKey, async (req, res) => {
     }
 
     // 6. Insert attendance
-    const { error: insertErr } = await db
+    let insertResult = await db
       .from('ATTENDANCE')
       .insert({
         session_ID: session.session_ID,
@@ -89,6 +89,33 @@ router.post('/mark', verifyDeviceApiKey, async (req, res) => {
         time_stamp: new Date().toISOString(),
         status: 'Present'
       });
+
+    let insertErr = insertResult.error;
+
+    // Self-healing fallback if database sequence is out of sync (ATTENDANCE_pkey collision)
+    if (insertErr && (insertErr.code === '23505' || insertErr.message?.includes('ATTENDANCE_pkey'))) {
+      console.warn('[ATTENDANCE] Sequence out of sync (ATTENDANCE_pkey). Recovering next ID...');
+      const { data: maxRow } = await db
+        .from('ATTENDANCE')
+        .select('attend_ID')
+        .order('attend_ID', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      const nextAttendId = (maxRow?.attend_ID || 0) + 1;
+
+      const retryResult = await db
+        .from('ATTENDANCE')
+        .insert({
+          attend_ID: nextAttendId,
+          session_ID: session.session_ID,
+          stu_ID: student.stu_ID,
+          time_stamp: new Date().toISOString(),
+          status: 'Present'
+        });
+
+      insertErr = retryResult.error;
+    }
 
     if (insertErr) throw insertErr;
 
