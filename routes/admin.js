@@ -688,7 +688,7 @@ router.post('/students', async (req, res) => {
     : 'PENDING_ENROLLMENT';
 
   try {
-    const { data, error } = await db
+    let { data, error } = await db
       .from('STUDENTS')
       .insert({
         roll_no: roll_no.trim(),
@@ -697,6 +697,33 @@ router.post('/students', async (req, res) => {
       })
       .select()
       .single();
+
+    // Auto-recover if PostgreSQL sequence is desynchronized (STUDENTS_pkey collision)
+    if (error && (error.code === '23505' || error.message?.includes('STUDENTS_pkey'))) {
+      console.warn('[STUDENTS] Sequence collision (STUDENTS_pkey). Calculating next stu_ID manually...');
+      const { data: maxRow } = await db
+        .from('STUDENTS')
+        .select('stu_ID')
+        .order('stu_ID', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      const nextStuId = (maxRow?.stu_ID || 0) + 1;
+
+      const retryResult = await db
+        .from('STUDENTS')
+        .insert({
+          stu_ID: nextStuId,
+          roll_no: roll_no.trim(),
+          name: name.trim(),
+          biometric_temp: templatePayload
+        })
+        .select()
+        .single();
+
+      data = retryResult.data;
+      error = retryResult.error;
+    }
 
     if (error) throw error;
 
