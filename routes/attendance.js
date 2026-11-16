@@ -83,6 +83,7 @@ router.post('/mark', verifyDeviceApiKey, async (req, res) => {
         status: 'already_marked',
         studentId: student.stu_ID,
         studentName: student.name,
+        rollNo: student.roll_no,
         sessionId: session.session_ID
       });
     }
@@ -135,6 +136,7 @@ router.post('/mark', verifyDeviceApiKey, async (req, res) => {
       status: 'marked',
       studentId: student.stu_ID,
       studentName: student.name,
+      rollNo: student.roll_no,
       sessionId: session.session_ID
     });
 
