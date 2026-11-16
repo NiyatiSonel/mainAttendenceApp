@@ -39,14 +39,33 @@ let pendingEnrollmentCommand = null;
 // -------------------------------------------------------------
 // 10. GET PENDING ENROLLMENT COMMAND FOR ESP32
 // -------------------------------------------------------------
-router.get('/pending-enrollment', verifyDeviceApiKey, (req, res) => {
+router.get('/pending-enrollment', verifyDeviceApiKey, async (req, res) => {
   try {
-    if (!pendingEnrollmentCommand) {
-      return res.json({ enroll: false });
+    // 1. Check in-memory variable
+    let command = pendingEnrollmentCommand;
+    pendingEnrollmentCommand = null;
+
+    // 2. If no in-memory command, check Supabase for any student with PENDING_ENROLLMENT status
+    if (!command) {
+      const { data: pendingStudent, error } = await db
+        .from('STUDENTS')
+        .select('stu_ID, roll_no')
+        .eq('biometric_temp', 'PENDING_ENROLLMENT')
+        .limit(1)
+        .maybeSingle();
+
+      if (!error && pendingStudent) {
+        command = {
+          action: 'enroll',
+          studentId: pendingStudent.stu_ID,
+          rollNo: pendingStudent.roll_no
+        };
+      }
     }
 
-    const command = pendingEnrollmentCommand;
-    pendingEnrollmentCommand = null;
+    if (!command) {
+      return res.json({ enroll: false });
+    }
 
     console.log(`Sending enrollment request to ESP32 for student ID #${command.studentId}`);
 
@@ -932,6 +951,12 @@ router.post('/students/:id/trigger-enroll', async (req, res) => {
     if (!student) {
       return res.status(404).json({ error: 'Student not found' });
     }
+
+    // Update student to PENDING_ENROLLMENT in database so request is persisted across Vercel instances
+    await db
+      .from('STUDENTS')
+      .update({ biometric_temp: 'PENDING_ENROLLMENT' })
+      .eq('stu_ID', stuId);
 
     pendingEnrollmentCommand = {
       action: 'enroll',
