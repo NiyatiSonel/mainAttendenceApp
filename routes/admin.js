@@ -40,6 +40,18 @@ let pendingEnrollmentCommand = null;
 // -------------------------------------------------------------
 router.get('/pending-enrollment', verifyDeviceApiKey, async (req, res) => {
   try {
+    // 0. Do not interrupt live attendance sessions with enrollment requests
+    const { data: activeSession } = await db
+      .from('SESSIONS')
+      .select('session_ID, end_time')
+      .eq('status', 1)
+      .limit(1)
+      .maybeSingle();
+
+    if (activeSession && (!activeSession.end_time || new Date(activeSession.end_time) > new Date())) {
+      return res.json({ enroll: false });
+    }
+
     // 1. Check in-memory variable
     let command = pendingEnrollmentCommand;
     pendingEnrollmentCommand = null;
@@ -66,6 +78,13 @@ router.get('/pending-enrollment', verifyDeviceApiKey, async (req, res) => {
       return res.json({ enroll: false });
     }
 
+    // Clear PENDING_ENROLLMENT in database so this request is consumed once and doesn't loop endlessly
+    await db
+      .from('STUDENTS')
+      .update({ biometric_temp: '' })
+      .eq('stu_ID', command.studentId)
+      .eq('biometric_temp', 'PENDING_ENROLLMENT');
+
     console.log(`Sending enrollment request to ESP32 for student ID #${command.studentId}`);
 
     res.json({
@@ -73,6 +92,24 @@ router.get('/pending-enrollment', verifyDeviceApiKey, async (req, res) => {
       studentId: command.studentId,
       rollNo: command.rollNo
     });
+  } catch (err) {
+    console.error('Pending enrollment error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Endpoint to cancel / reset enrollment if ESP32 fails or times out
+router.post('/biometrics/cancel', verifyDeviceApiKey, async (req, res) => {
+  const { studentId } = req.body;
+  if (studentId) {
+    await db
+      .from('STUDENTS')
+      .update({ biometric_temp: '' })
+      .eq('stu_ID', studentId)
+      .eq('biometric_temp', 'PENDING_ENROLLMENT');
+  }
+  res.json({ success: true });
+});
   } catch (err) {
     console.error('Pending enrollment error:', err.message);
     res.status(500).json({ error: err.message });
