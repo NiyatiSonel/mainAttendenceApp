@@ -5,6 +5,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { verifyTeacherToken } = require('../middleware/teacherAuth');
 const { sendResetOtpEmail } = require('../utils/mailer');
+const { autoCloseExpiredSessions } = require('../utils/sessionHelper');
 
 // Helper to decode hex strings (e.g. \x445341...) if columns were stored as BYTEA
 function decodeHexIfNeeded(str) {
@@ -698,6 +699,9 @@ router.get('/sessions/active', async (req, res) => {
   const teacherId = req.teacher.id;
 
   try {
+    // 1. Auto-close any expired sessions
+    await autoCloseExpiredSessions();
+
     const { data: session, error } = await db
       .from('SESSIONS')
       .select('session_ID, device_ID, start_time, end_time, status, DEVICES(mac_address)')
@@ -709,6 +713,15 @@ router.get('/sessions/active', async (req, res) => {
 
     if (error) throw error;
     if (!session) {
+      return res.json(null);
+    }
+
+    // Safety check: if session end_time is past, close it immediately
+    if (session.end_time && new Date(session.end_time) <= new Date()) {
+      await db
+        .from('SESSIONS')
+        .update({ status: 0 })
+        .eq('session_ID', session.session_ID);
       return res.json(null);
     }
 

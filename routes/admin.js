@@ -9,6 +9,7 @@ const {
   verifyDeviceApiKey
 } = require('../middleware/auth');
 const { sendResetOtpEmail } = require('../utils/mailer');
+const { autoCloseExpiredSessions } = require('../utils/sessionHelper');
 
 // Helper to decode hex strings (e.g. \x445341...) if columns were stored as BYTEA
 function decodeHexIfNeeded(str) {
@@ -308,9 +309,12 @@ router.post('/reset-password', async (req, res) => {
 // -------------------------------------------------------------
 router.get('/pending-attendance', verifyDeviceApiKey, async (req, res) => {
   try {
+    // Auto-close any expired sessions
+    await autoCloseExpiredSessions();
+
     const { data: session, error } = await db
       .from('SESSIONS')
-      .select('session_ID, sub_ID, device_ID')
+      .select('session_ID, sub_ID, device_ID, end_time')
       .eq('status', 1)
       .order('session_ID', { ascending: false })
       .limit(1)
@@ -319,6 +323,11 @@ router.get('/pending-attendance', verifyDeviceApiKey, async (req, res) => {
     if (error) throw error;
 
     if (!session) {
+      return res.json({ attendance: false });
+    }
+
+    if (session.end_time && new Date(session.end_time) <= new Date()) {
+      await db.from('SESSIONS').update({ status: 0 }).eq('session_ID', session.session_ID);
       return res.json({ attendance: false });
     }
 
@@ -339,6 +348,8 @@ router.get('/pending-attendance', verifyDeviceApiKey, async (req, res) => {
 // -------------------------------------------------------------
 router.get('/attendance-templates', verifyDeviceApiKey, async (req, res) => {
   try {
+    await autoCloseExpiredSessions();
+
     const sessionId = parseInt(req.query.sessionId, 10);
 
     if (!sessionId) {
@@ -347,15 +358,18 @@ router.get('/attendance-templates', verifyDeviceApiKey, async (req, res) => {
 
     const { data: session, error: sessionErr } = await db
       .from('SESSIONS')
-      .select('session_ID, sub_ID, device_ID')
+      .select('session_ID, sub_ID, device_ID, end_time')
       .eq('session_ID', sessionId)
       .eq('status', 1)
       .maybeSingle();
 
     if (sessionErr) throw sessionErr;
 
-    if (!session) {
-      return res.status(404).json({ error: 'Active attendance session not found' });
+    if (!session || (session.end_time && new Date(session.end_time) <= new Date())) {
+      if (session) {
+        await db.from('SESSIONS').update({ status: 0 }).eq('session_ID', session.session_ID);
+      }
+      return res.status(404).json({ error: 'Active attendance session not found or expired' });
     }
 
     // Get enrolled students

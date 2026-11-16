@@ -8,6 +8,7 @@ const db = require('../db');
 const {
   verifyDeviceApiKey
 } = require('../middleware/auth');
+const { autoCloseExpiredSessions } = require('../utils/sessionHelper');
 
 // =============================================================
 // MARK ATTENDANCE FROM ESP32
@@ -24,10 +25,13 @@ router.post('/mark', verifyDeviceApiKey, async (req, res) => {
   }
 
   try {
+    // Auto-close any expired sessions
+    await autoCloseExpiredSessions();
+
     // 2. Find currently active attendance session
     const { data: session, error: sessionErr } = await db
       .from('SESSIONS')
-      .select('session_ID, sub_ID, device_ID')
+      .select('session_ID, sub_ID, device_ID, end_time')
       .eq('status', 1)
       .order('session_ID', { ascending: false })
       .limit(1)
@@ -35,10 +39,13 @@ router.post('/mark', verifyDeviceApiKey, async (req, res) => {
 
     if (sessionErr) throw sessionErr;
 
-    if (!session) {
+    if (!session || (session.end_time && new Date(session.end_time) <= new Date())) {
+      if (session) {
+        await db.from('SESSIONS').update({ status: 0 }).eq('session_ID', session.session_ID);
+      }
       return res.status(404).json({
         status: 'no_active_session',
-        error: 'No active attendance session found'
+        error: 'No active attendance session found or session has expired'
       });
     }
 
