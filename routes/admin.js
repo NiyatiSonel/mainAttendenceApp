@@ -8,7 +8,6 @@ const {
   verifyAdminToken,
   verifyDeviceApiKey
 } = require('../middleware/auth');
-const { sendResetOtpEmail } = require('../utils/mailer');
 const { autoCloseExpiredSessions } = require('../utils/sessionHelper');
 
 // Helper to decode hex strings (e.g. \x445341...) if columns were stored as BYTEA
@@ -204,126 +203,6 @@ router.post('/login', async (req, res) => {
 });
 
 // -------------------------------------------------------------
-// ADMIN FORGOT PASSWORD - REQUEST OTP
-// -------------------------------------------------------------
-router.post('/forgot-password', async (req, res) => {
-  const { email } = req.body;
-
-  if (!email || !email.trim()) {
-    return res.status(400).json({ error: 'Email address is required' });
-  }
-
-  const cleanEmail = email.trim().toLowerCase();
-
-  // Protect Super Admin root account
-  if (cleanEmail === SUPER_ADMIN.email.toLowerCase()) {
-    return res.status(403).json({
-      error: 'The Super Administrator account is configured directly on the server (.env). To change its credentials, update SUPER_ADMIN_PASSWORD in your server environment variables.'
-    });
-  }
-
-  try {
-    const { data: admin, error } = await db
-      .from('ADMIN')
-      .select('admin_ID, name, email')
-      .ilike('email', cleanEmail)
-      .maybeSingle();
-
-    if (error) throw error;
-
-    if (!admin) {
-      return res.status(404).json({ error: 'No administrator account found with this email address.' });
-    }
-
-    // Generate cryptographically random 6-digit OTP
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    const otpHash = bcrypt.hashSync(otp, 8);
-
-    // Sign stateless reset token valid for 10 minutes (serverless-friendly)
-    const resetToken = jwt.sign(
-      { id: admin.admin_ID, email: admin.email, role: 'admin', otpHash, type: 'reset_token' },
-      process.env.JWT_SECRET,
-      { expiresIn: '10m' }
-    );
-
-    // Send email or log to console
-    const mailResult = await sendResetOtpEmail({
-      to: admin.email,
-      name: admin.name,
-      otp,
-      role: 'admin'
-    });
-
-    return res.json({
-      success: true,
-      message: mailResult.message,
-      resetToken,
-      email: admin.email,
-      devOtp: mailResult.otp
-    });
-  } catch (err) {
-    console.error('Admin forgot password error:', err.message);
-    return res.status(500).json({ error: err.message || 'Failed to process password reset request.' });
-  }
-});
-
-// -------------------------------------------------------------
-// ADMIN RESET PASSWORD - VERIFY OTP & UPDATE
-// -------------------------------------------------------------
-router.post('/reset-password', async (req, res) => {
-  const { resetToken, otp, newPassword } = req.body;
-
-  if (!resetToken) {
-    return res.status(400).json({ error: 'Verification session missing. Please request a new code.' });
-  }
-
-  if (!otp || !otp.toString().trim()) {
-    return res.status(400).json({ error: '6-digit verification code is required.' });
-  }
-
-  if (!newPassword || newPassword.length < 6) {
-    return res.status(400).json({ error: 'New password must be at least 6 characters long.' });
-  }
-
-  try {
-    let decoded;
-    try {
-      decoded = jwt.verify(resetToken, process.env.JWT_SECRET);
-    } catch (err) {
-      return res.status(400).json({ error: 'Verification session has expired or is invalid. Please request a new code.' });
-    }
-
-    if (decoded.type !== 'reset_token' || decoded.role !== 'admin') {
-      return res.status(400).json({ error: 'Invalid reset token format.' });
-    }
-
-    // Verify OTP matches hash
-    const isMatch = bcrypt.compareSync(otp.toString().trim(), decoded.otpHash);
-    if (!isMatch) {
-      return res.status(400).json({ error: 'Invalid verification code. Please check and try again.' });
-    }
-
-    // Hash new password and update in Supabase
-    const newHash = bcrypt.hashSync(newPassword, 10);
-
-    const { error: updateErr } = await db
-      .from('ADMIN')
-      .update({ pass_hash: newHash })
-      .eq('admin_ID', decoded.id);
-
-    if (updateErr) throw updateErr;
-
-    return res.json({
-      success: true,
-      message: 'Password reset successfully! You can now log in with your new password.'
-    });
-  } catch (err) {
-    console.error('Admin reset password error:', err.message);
-    return res.status(500).json({ error: err.message || 'Failed to reset password.' });
-  }
-});
-
-// -------------------------------------------------------------
 // ESP32 - PENDING ATTENDANCE SESSION
 // -------------------------------------------------------------
 router.get('/pending-attendance', verifyDeviceApiKey, async (req, res) => {
@@ -434,6 +313,15 @@ router.get('/attendance-templates', verifyDeviceApiKey, async (req, res) => {
 // Protect all following admin routes
 router.use(verifyAdminToken);
 
+// Current admin profile / role check
+router.get('/me', (req, res) => {
+  res.json({
+    id: req.admin.id,
+    role: req.admin.role,
+    isSuper: Boolean(req.admin.isSuper)
+  });
+});
+
 // -------------------------------------------------------------
 // 2. DASHBOARD METRICS
 // -------------------------------------------------------------
@@ -505,6 +393,46 @@ router.delete('/teachers/:id', async (req, res) => {
     if (error) throw error;
     res.json({ message: 'Teacher deleted successfully' });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// SUPERADMIN - UPDATE TEACHER PASSWORD
+router.put('/teachers/:id/password', async (req, res) => {
+  if (!req.admin.isSuper) {
+    return res.status(403).json({ error: 'Only Super Administrator can directly edit teacher passwords.' });
+  }
+
+  const teacherId = parseInt(req.params.id, 10);
+  const { new_password } = req.body;
+
+  if (!new_password || new_password.trim().length < 6) {
+    return res.status(400).json({ error: 'New password must be at least 6 characters long.' });
+  }
+
+  try {
+    const { data: teacher, error: fetchErr } = await db
+      .from('TEACHER')
+      .select('teacher_ID, name')
+      .eq('teacher_ID', teacherId)
+      .maybeSingle();
+
+    if (fetchErr) throw fetchErr;
+    if (!teacher) {
+      return res.status(404).json({ error: 'Teacher not found.' });
+    }
+
+    const pass_hash = bcrypt.hashSync(new_password.trim(), 10);
+    const { error: updateErr } = await db
+      .from('TEACHER')
+      .update({ pass_hash })
+      .eq('teacher_ID', teacherId);
+
+    if (updateErr) throw updateErr;
+
+    res.json({ message: `Password for teacher "${teacher.name}" updated successfully.` });
+  } catch (err) {
+    console.error('Update teacher password error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -956,6 +884,49 @@ router.delete('/admins/:id', async (req, res) => {
 
     res.json({ message: 'Administrator account deleted successfully.' });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// SUPERADMIN - UPDATE ADMIN PASSWORD
+router.put('/admins/:id/password', async (req, res) => {
+  if (!req.admin.isSuper) {
+    return res.status(403).json({ error: 'Only Super Administrator can directly edit administrator passwords.' });
+  }
+
+  const targetId = parseInt(req.params.id, 10);
+  if (targetId === 0) {
+    return res.status(400).json({ error: 'Super Admin password is configured via server environment variables.' });
+  }
+
+  const { new_password } = req.body;
+  if (!new_password || new_password.trim().length < 6) {
+    return res.status(400).json({ error: 'New password must be at least 6 characters long.' });
+  }
+
+  try {
+    const { data: admin, error: fetchErr } = await db
+      .from('ADMIN')
+      .select('admin_ID, name')
+      .eq('admin_ID', targetId)
+      .maybeSingle();
+
+    if (fetchErr) throw fetchErr;
+    if (!admin) {
+      return res.status(404).json({ error: 'Admin account not found in database.' });
+    }
+
+    const pass_hash = bcrypt.hashSync(new_password.trim(), 10);
+    const { error: updateErr } = await db
+      .from('ADMIN')
+      .update({ pass_hash })
+      .eq('admin_ID', targetId);
+
+    if (updateErr) throw updateErr;
+
+    res.json({ message: `Password for admin "${admin.name}" updated successfully.` });
+  } catch (err) {
+    console.error('Update admin password error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
