@@ -110,11 +110,6 @@ router.post('/biometrics/cancel', verifyDeviceApiKey, async (req, res) => {
   }
   res.json({ success: true });
 });
-  } catch (err) {
-    console.error('Pending enrollment error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
 
 // -------------------------------------------------------------
 // ESP32 - RECEIVE FINGERPRINT TEMPLATE
