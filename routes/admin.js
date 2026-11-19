@@ -723,7 +723,7 @@ router.get('/enrollments', async (req, res) => {
     const { data: enrollments, error } = await db
       .from('ENROLLMENTS')
       .select('enroll_ID, stu_ID, sub_ID')
-      .order('enroll_ID', { ascending: false });
+      .order('enroll_ID', { ascending: true });
 
     if (error) throw error;
 
