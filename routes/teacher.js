@@ -296,8 +296,10 @@ router.get('/subjects/:subId/students/:studentId/report', async (req, res) => {
       return {
         session_id: s.session_ID,
         date: s.start_time,
+        start_time: s.start_time,
         status: isPresent ? 'Present' : 'Absent',
-        marked_time: record?.time_stamp || 'N/A'
+        marked_time: record?.time_stamp || 'N/A',
+        marked_at: record?.time_stamp || null
       };
     });
 
